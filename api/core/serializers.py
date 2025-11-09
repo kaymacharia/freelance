@@ -401,6 +401,7 @@ class JobSearchSerializer(serializers.ModelSerializer):
         child=serializers.CharField(), write_only=True)
     skills_required_display = SkillSerializer(
         many=True, read_only=True, source='skills_required')
+    selected_freelancer = serializers.SerializerMethodField()
 
     class Meta:
         model = Job
@@ -449,6 +450,14 @@ class JobSearchSerializer(serializers.ModelSerializer):
             'total_amount_paid': total_paid,
             'total_freelancers_hired': hired_count
         }
+    
+    def get_selected_freelancer(self, obj):
+        """
+        Return the username instead of ID for the selected freelancer.
+        """
+        if not obj.selected_freelancer:
+            return None
+        return obj.selected_freelancer.username
 
     def get_urgency(self, obj):
         if obj.deadline_date:

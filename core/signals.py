@@ -5,6 +5,8 @@ from django.db.models.signals import post_save,pre_save
 from django.dispatch import receiver
 from core.models import Job,Chat,Profile,Response,Message
 from django.core.exceptions import ValidationError
+from wallet.models import WalletTransaction
+from decimal import Decimal
 
 @receiver(pre_save, sender=Job)
 def cache_old_job_values(sender, instance, **kwargs):
@@ -74,12 +76,14 @@ def manage_chat_on_job_update(sender, instance, created, **kwargs):
     new_freelancer = job.selected_freelancer
     new_payment = job.payment_verified
 
+    # --- If a new freelancer is assigned ---
     if new_freelancer:
         try:
             freelancer_profile = Profile.objects.get(user=new_freelancer)
         except Profile.DoesNotExist:
             return
 
+        # Create or get chat
         chat, chat_created = Chat.objects.get_or_create(
             job=job,
             client=job.client,
@@ -87,6 +91,7 @@ def manage_chat_on_job_update(sender, instance, created, **kwargs):
             defaults={'active': new_payment},
         )
 
+        # Deactivate old freelancer chat if changed
         if old_freelancer and old_freelancer != new_freelancer:
             try:
                 old_profile = Profile.objects.get(user=old_freelancer)
@@ -95,10 +100,16 @@ def manage_chat_on_job_update(sender, instance, created, **kwargs):
             except Profile.DoesNotExist:
                 pass
 
+        # Activate chat if payment verified
         if new_payment and not chat.active:
             chat.active = True
             chat.save()
 
+        # Create the first chat message automatically
+        if not old_freelancer or old_freelancer != new_freelancer:
+            send_initial_chat_message(job, job.client, freelancer_profile)
+
+    # --- If freelancer removed, deactivate chats ---
     elif old_freelancer and not new_freelancer:
         try:
             old_profile = Profile.objects.get(user=old_freelancer)
@@ -106,3 +117,42 @@ def manage_chat_on_job_update(sender, instance, created, **kwargs):
                 job=job, freelancer=old_profile).update(active=False)
         except Profile.DoesNotExist:
             pass
+
+
+def send_initial_chat_message(job, client_profile, freelancer_profile):
+    """
+    Auto-create a welcome message from the client once a freelancer is accepted.
+    """
+    chat, _ = Chat.objects.get_or_create(
+        job=job,
+        client=client_profile,
+        freelancer=freelancer_profile,
+        defaults={'active': True},
+    )
+
+    # Get latest platform fee rate
+    latest_tx = WalletTransaction.objects.order_by('-timestamp').first()
+    fee_rate = latest_tx.rate if latest_tx else Decimal('10.00')
+
+    gross = job.price or Decimal('0.00')
+    fee = (fee_rate / Decimal('100')) * gross
+    net_amount = gross - fee
+
+    # Compose a friendly message
+    message_text = (
+        f"👋 Hi {freelancer_profile.user.first_name or freelancer_profile.user.username},\n\n"
+        f"I’m {client_profile.user.first_name or client_profile.user.username}, "
+        f"and I’ve just accepted you for the job **'{job.title}'**.\n\n"
+        f"Project rate (after platform fee): Kes {net_amount:.2f}\n"
+        f"📅 Expected deadline: {job.deadline_date.strftime('%b %d, %Y') if job.deadline_date else 'Not specified'}\n\n"
+        f"Welcome aboard! Feel free to ask any questions or share your ideas here — "
+        f"we’re excited to get started.\n\n"
+        f"— {client_profile.user.first_name or client_profile.user.username}"
+    )
+
+    # Save as a message in the chat
+    Message.objects.create(
+        chat=chat,
+        sender=client_profile.user,
+        content=message_text
+    )

@@ -1,8 +1,5 @@
 from drf_spectacular.utils import extend_schema_field, OpenApiTypes, OpenApiResponse, extend_schema, OpenApiParameter, OpenApiRequest, extend_schema_view
 from rest_framework.throttling import ScopedRateThrottle
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
-from django.db import DatabaseError, IntegrityError
 from rest_framework.exceptions import PermissionDenied,NotFound,ValidationError
 from rest_framework import generics, permissions
 from rest_framework import viewsets, status,filters,permissions,generics
@@ -10,26 +7,33 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated,AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.pagination import PageNumberPagination
-from django.db import IntegrityError, DatabaseError
 from rest_framework import serializers
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
-
+from rest_framework.response import Response as DRFResponse
+from rest_framework.views import APIView
 
 from django.shortcuts import get_object_or_404,redirect
+from django.contrib.sites.shortcuts import get_current_site
+from django.core.mail import EmailMultiAlternatives
+from django.utils.html import format_html
+from django.conf import settings
 from django.http import FileResponse
 from django.db.models import Exists, OuterRef
 from django.db.models import Count,Prefetch
 from django.contrib.auth import get_user_model
-from django.core.exceptions import PermissionDenied
+from django.db.models.functions import Coalesce
+from django.db import IntegrityError, DatabaseError
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+from django.db.models import Q, F, Value, IntegerField, Sum, DecimalField
+
+
 from accounts.models import Profile, FreelancerProfile,Skill
 from core.models import Job, JobCategory,Chat, Message, MessageAttachment, Review,JobBookmark,Notification,Response as JobResponse
 from api.core.matching import match_freelancers_to_job, recommend_jobs_to_freelancer
 from api.core.jobsmatch import JobMatcher
 from api.wallet.utility import get_wallet_stats
-
-from rest_framework.response import Response as DRFResponse
-from rest_framework.views import APIView
 
 from api.core.filters import JobFilter,AdvancedJobFilter,JobDiscoveryFilter,get_job_filters
 from api.core.serializers import ( 
@@ -45,18 +49,17 @@ from .permissions import (
 from core.choices import JOB_STATUS_CHOICES, ALLOWED_STATUS_FILTERS
 from payment.models import Payment
 from payments.models import PaypalPayments
-from wallet.models import WalletTransaction
-from django.db.models import Q,F,Value, IntegerField,Sum,DecimalField
-from django.db.models.functions import Coalesce
+from wallet.models import WalletTransaction,Rate
 
 import logging
+from decimal import Decimal
+from datetime import datetime
 from datetime import timedelta
 from django.utils import timezone
-from datetime import datetime
+
+
 
 logger = logging.getLogger(__name__)
-
-
 User = get_user_model()
 
 
@@ -145,20 +148,26 @@ class JobViewSet(viewsets.ModelViewSet):
 
     def _get_enriched_paginated_response(self, queryset, extra_meta=None):
         """
-        Utility to paginate, serialize and enrich jobs with `bookmarked` and `has_applied`.
-        Ensures correct values for the authenticated freelancer.
+        Utility to paginate, serialize and enrich jobs with `bookmarked`, `has_applied`,
+        and `application_status` for freelancers.
         """
         user = self.request.user
         profile = getattr(user, 'profile', None)
-        is_freelancer = user.is_authenticated and getattr(profile, 'user_type', '') == 'freelancer'
+        is_freelancer = (
+            user.is_authenticated and getattr(
+                profile, 'user_type', '') == 'freelancer'
+        )
 
-        bookmarked_ids, applied_ids = set(), set()
+        bookmarked_ids, applied_ids, application_statuses = set(), set(), {}
         if is_freelancer:
-            # Collect IDs once (efficient lookups later)
+            # Collect bookmark and application data efficiently
             bookmarked_ids = set(user.bookmarks.values_list('job_id', flat=True))
-            applied_ids = set(
-                JobResponse.objects.filter(user=user).values_list('job_id', flat=True)
-            )
+
+            # Fetch JobResponse objects to know the application status per job
+            responses = JobResponse.objects.filter(
+                user=user).values('job_id', 'status')
+            applied_ids = {r['job_id'] for r in responses}
+            application_statuses = {r['job_id']: r['status'] for r in responses}
 
         page = self.paginate_queryset(queryset)
         serializer = self.get_serializer(page, many=True)
@@ -171,6 +180,11 @@ class JobViewSet(viewsets.ModelViewSet):
                 "bookmarked": bool(job_id in bookmarked_ids),
                 "has_applied": bool(job_id in applied_ids),
             }
+
+            if is_freelancer:
+                enriched_job["application_status"] = application_statuses.get(
+                    job_id)
+
             enriched.append(enriched_job)
 
         paginated = self.get_paginated_response(enriched)
@@ -180,7 +194,7 @@ class JobViewSet(viewsets.ModelViewSet):
             paginated.data.update(extra_meta)
 
         return paginated
-
+    
     @extend_schema(
         summary="Discover jobs with advanced filters",
         description=(
@@ -293,13 +307,18 @@ class JobViewSet(viewsets.ModelViewSet):
         user = request.user
         bookmarked = False
         applied = False
+        application_status = None
 
         if user.is_authenticated and hasattr(user, 'profile') and user.profile.user_type == 'freelancer':
             bookmarked = user.bookmarks.filter(job=instance).exists()
-            applied = JobResponse.objects.filter(user=user, job=instance).exists()
+            response = JobResponse.objects.filter(user=user, job=instance).first()
+            applied = response is not None
+            if response:
+                application_status = response.status
 
         data['bookmarked'] = bookmarked
         data['has_applied'] = applied
+        data['application_status'] = application_status
 
         return DRFResponse(data)
 
@@ -737,35 +756,103 @@ class AcceptFreelancerView(APIView):
     def post(self, request, slug, identifier):
         job = get_object_or_404(Job, slug=slug)
 
-        # Check if the requester is the job owner
+        # Check if requester is job owner
         if job.client.user != request.user:
-            return DRFResponse({'detail': 'You are not the owner of this job.'}, status=status.HTTP_403_FORBIDDEN)
+            return DRFResponse(
+                {'detail': 'You are not the owner of this job.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
-        # Try to resolve identifier to a User (username first, then ID)
-        freelancer = User.objects.filter(username=identifier).first(
-        ) or User.objects.filter(id__iexact=identifier).first()
+        # Find freelancer by username or ID
+        freelancer = (
+            User.objects.filter(username=identifier).first()
+            or User.objects.filter(id__iexact=identifier).first()
+        )
         if not freelancer:
             return DRFResponse({'error': 'Freelancer not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Ensure this freelancer actually applied to the job
+        # Ensure freelancer applied
         if not JobResponse.objects.filter(job=job, user=freelancer).exists():
             return DRFResponse({'error': 'This freelancer did not apply to this job.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Ensure no freelancer is already selected
+        # Ensure no one already selected
         if job.selected_freelancer:
             return DRFResponse({'error': 'A freelancer has already been accepted for this job.'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if job.payment_verified:
 
-            # Accept the freelancer
-            job.selected_freelancer = freelancer
-            job.status = 'in_progress'
-            job.save()
-        
-        else:
-            return DRFResponse({'message': f'{request.user.username} You can only accept a client after making the full deposit.'}, status=status.HTTP_200_OK)
+        if not job.payment_verified:
+            return DRFResponse(
+                {'message': f'{request.user.username}, you can only accept a freelancer after making the full deposit.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        return DRFResponse({'message': f'{freelancer.username} has been accepted for this job.'}, status=status.HTTP_200_OK)
+        # Accept the freelancer
+        job.selected_freelancer = freelancer
+        job.status = 'in_progress'
+        job.save()
+
+        # Determine correct rate & net amount
+        try:
+            current_rate = Rate.objects.latest('effective_from').rate_amount
+        except Rate.DoesNotExist:
+            # fallback if no dynamic rate exists
+            current_rate = Decimal('8.00')
+
+        gross_amount = job.price
+        fee = (current_rate / Decimal('100')) * gross_amount
+        net_amount = gross_amount - fee
+
+
+        # Send email
+        current_site = get_current_site(request)
+        client_name = f"{request.user.first_name} {request.user.last_name}".strip(
+        ) or request.user.username
+        subject = f"🎉 You've been selected for the job: {job.title}"
+
+        text_content = (
+            f"Hi {freelancer.first_name or freelancer.username},\n\n"
+            f"You've been selected by {client_name} for the job '{job.title}'.\n"
+            f"Gross amount: Kes {gross_amount}\n"
+            f"Platform fee: {current_rate}%\n"
+            f"Your net payout: Kes {net_amount}\n\n"
+            f"Visit {current_site.domain}/jobs/{job.slug} for full details.\n\n"
+            "Best regards,\nThe Team"
+        )
+
+        html_content = format_html(
+            f"""
+            <div style="font-family: 'Segoe UI', Arial, sans-serif; text-align: center; background-color: #f5f3ff; padding: 30px; border-radius: 12px;">
+                <h2 style="color: #6b21a8;">Congratulations, {freelancer.first_name or freelancer.username}! 🎉</h2>
+                <p style="font-size: 16px; color: #4b5563;">
+                    You’ve been selected by <strong style="color:#6b21a8;">{client_name}</strong> 
+                    for the job <strong>“{job.title}”</strong>.
+                </p>
+                <p style="font-size: 15px; color: #4b5563;">
+                    <strong>Gross amount:</strong> ${gross_amount}<br>
+                    <strong>Platform fee:</strong> {current_rate}%<br>
+                    <strong>Net payout:</strong> ${net_amount}
+                </p>
+                <a href="https://{current_site.domain}/jobs/{job.slug}" 
+                   style="display:inline-block; margin-top:20px; background-color:#6b21a8; color:#ffffff; text-decoration:none; padding:12px 25px; border-radius:8px; font-size:16px;">
+                    View Job Details
+                </a>
+                <p style="margin-top:25px; font-size:14px; color:#6b7280;">
+                    Please log in to your account to start chatting with the client and begin your work.
+                </p>
+                <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;">
+                <p style="font-size:13px; color:#9ca3af;">
+                    © {current_site.name or "Our Platform"} | This is an automated message, please do not reply.
+                </p>
+            </div>
+            """
+        )
+
+        msg = EmailMultiAlternatives(
+            subject, text_content, to=[freelancer.email])
+        msg.attach_alternative(html_content, "text/html")
+        msg.send()
+
+        return DRFResponse({'message': f'{freelancer.username} has been accepted for this job and notified via email.'}, status=status.HTTP_200_OK)
+
 
 
 @extend_schema(
@@ -806,6 +893,31 @@ class RejectFreelancerView(APIView):
         job.save()
 
         return DRFResponse({'message': f'{freelancer.username} has been unassigned from this job.'}, status=status.HTTP_200_OK)
+
+
+class AppliedJobsByFreelancerView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # Get all the user's responses
+        responses = JobResponse.objects.filter(user=user).select_related('job')
+        response_map = {r.job_id: r.status for r in responses}
+
+        # Get the related jobs
+        jobs = Job.objects.filter(id__in=response_map.keys()).distinct()
+
+        # Serialize job data
+        serializer = JobSearchSerializer(
+            jobs, many=True, context={'request': request})
+
+        # Add application status to each job
+        data = serializer.data
+        for item in data:
+            item["application_status"] = response_map.get(item["id"])
+
+        return DRFResponse(data)
 
 
 @method_decorator(cache_page(60 * 5), name='dispatch')

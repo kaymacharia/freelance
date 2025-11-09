@@ -36,34 +36,45 @@ class GoogleAuthSerializer(serializers.Serializer):
                     {"error": "Invalid or expired Google token."}
                 )
 
-        # --- Extract name parts ---
-        first_name, *last_name_parts = name.split(" ", 1)
-        last_name = last_name_parts[0] if last_name_parts else ""
-
         if not email:
             raise serializers.ValidationError(
-                {"error": "Google account missing email."}
-            )
+                {"error": "Google account missing email."})
 
-        # --- Get or create user ---
-        user, created = User.objects.get_or_create(
-            email=email,
-            defaults={
-                "username": email.split("@")[0],
-                "first_name": first_name,
-                "last_name": last_name,
-                "is_active": True,
-            },
-        )
+        # --- Normalize email ---
+        email = email.strip().lower()
+
+        # --- Try to find existing user ---
+        user = User.objects.filter(email__iexact=email).first()
+
+        if user:
+            created = False
+        else:
+            # --- If user doesn't exist and no user_type provided ---
+            if not user_type:
+                raise serializers.ValidationError(
+                    {"error": "User not found. Please sign up first using Google signup."}
+                )
+
+            # --- Otherwise create new user ---
+            first_name, *last_name_parts = name.split(" ", 1)
+            last_name = last_name_parts[0] if last_name_parts else ""
+
+            user = User.objects.create(
+                email=email,
+                username=email.split("@")[0],
+                first_name=first_name,
+                last_name=last_name,
+                is_active=True,
+            )
+            created = True
 
         # --- Ensure profile exists ---
         profile, _ = Profile.objects.get_or_create(
             user=user,
-            # fallback if missing
             defaults={"user_type": user_type or "freelancer"},
         )
 
-        # --- If user already existed but user_type was passed, update it ---
+        # --- Update user_type if explicitly passed and changed ---
         if user_type and profile.user_type != user_type:
             profile.user_type = user_type
             profile.save(update_fields=["user_type"])

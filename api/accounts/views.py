@@ -1,30 +1,24 @@
-from django.contrib.auth.models import User
 from .serializers import ClientProfileWriteSerializer, ClientProfileReadSerializer
 from drf_spectacular.utils import extend_schema, OpenApiResponse
-from django.core.exceptions import PermissionDenied
-from django.shortcuts import get_object_or_404
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-from rest_framework import viewsets, status, permissions
 from rest_framework_simplejwt.tokens import RefreshToken
 from datetime import timedelta, datetime
-from rest_framework.exceptions import ValidationError, NotFound
+from rest_framework.exceptions import ValidationError, NotFound,PermissionDenied
 from rest_framework.decorators import action
-from rest_framework import viewsets, permissions
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
 from rest_framework import viewsets, status, permissions,generics,filters,mixins
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken,TokenError
-from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.parsers import JSONParser
+from rest_framework.parsers import MultiPartParser, FormParser,JSONParser
 from rest_framework.permissions import AllowAny,IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
-from rest_framework.exceptions import PermissionDenied
 from rest_framework_simplejwt.settings import api_settings as jwt_settings
+
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample, OpenApiParameter, extend_schema_view
 
-
+from django.contrib.auth.models import User
+from django.shortcuts import get_object_or_404
 from django.core.mail import EmailMultiAlternatives
 from django.contrib.sites.shortcuts import get_current_site
 from django.utils.html import format_html
@@ -34,7 +28,6 @@ from django.http import FileResponse, Http404
 from django.contrib.auth import get_user_model
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.contrib.auth import password_validation
-from rest_framework.exceptions import ValidationError
 from django.utils.encoding import force_bytes
 from django.shortcuts import get_object_or_404,redirect
 from django.conf import settings
@@ -404,34 +397,44 @@ class GoogleAuthView(APIView):
 
     @extend_schema(
         summary="Google Sign Up / Login",
-        description="Authenticate a user using Google ID token and issue JWT tokens.",
+        description=(
+            "Authenticate a user using a Google ID token. "
+            "If the user exists → log in and issue JWT tokens. "
+            "If not, and a user_type is provided → create a new user and issue tokens. "
+            "Otherwise, return a 400 error prompting signup."
+        ),
         request=GoogleAuthSerializer,
         responses={
             200: OpenApiResponse(description="Google login successful."),
-            201: OpenApiResponse(description="Google signup successful.")
+            201: OpenApiResponse(description="Google signup successful."),
+            400: OpenApiResponse(description="User not found or invalid Google token."),
         }
     )
     def post(self, request):
-        
-        
         serializer = GoogleAuthSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data['user']
-        created = serializer.validated_data['created']
 
-        # Issue tokens
+        user = serializer.validated_data["user"]
+        created = serializer.validated_data["created"]
+
+        # --- Issue JWT tokens ---
         refresh = RefreshToken.for_user(user)
         access = refresh.access_token
 
+        # --- Build response payload ---
         response_data = {
-            'message': 'Google signup successful.' if created else 'Google login successful.',
-            'user': AuthUserSerializer(user, context={'request': request}).data,
-            'access': str(access),
-            'refresh': str(refresh)
+            "message": "Google signup successful." if created else "Google login successful.",
+            "is_new": created,
+            "user": AuthUserSerializer(user, context={"request": request}).data,
+            'user_type': user.profile.user_type,
+            "access": str(access),
+            "refresh": str(refresh),
         }
 
-        return Response(response_data,
-                        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+        return Response(
+            response_data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        )
 
 
 class PasswordChangeView(APIView):

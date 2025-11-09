@@ -430,6 +430,8 @@ cloudinary.config(
 )
 
 
+
+
 CLOUDINARY_FOLDERS = {
     'TRAINING': 'freelance/pdf_documents',
     'PROFILE': 'freelance/profile_pic',

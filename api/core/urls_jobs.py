@@ -3,7 +3,7 @@ from .views import (
                     JobViewSet, JobCategoryListCreateView,JobCategoryRetrieveUpdateDeleteView,
                     ApplyToJobView,UnapplyFromJobView,JobDiscoveryView,UpdateResponseFilesView,
                     ResponseListForJobView, AcceptFreelancerView, RejectFreelancerView,
-                    JobsWithResponsesView,AdvancedJobSearchAPIView,
+                    JobsWithResponsesView,AdvancedJobSearchAPIView,AppliedJobsByFreelancerView,
                     ClientJobStatusView,DashboardSummaryView
                     
 )
@@ -50,6 +50,7 @@ urlpatterns = [
     path('<slug:slug>/apply/', ApplyToJobView.as_view(), name='job-apply'),
     path('<slug:slug>/unapply/', UnapplyFromJobView.as_view(), name='job-unapply'),
     path('<slug:slug>/update-files/', UpdateResponseFilesView.as_view(), name='update-response-files'),
+    path('applied/by-freelancer/', AppliedJobsByFreelancerView.as_view(), name='applied-jobs'),
 
     
 

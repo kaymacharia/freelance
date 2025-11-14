@@ -35,7 +35,7 @@ ALLOWED_HOSTS = [
 ]
 
 
-FRONTEND_URL = 'http://127.0.0.1:3000' #os.getenv('FRONTEND_URL')
+FRONTEND_URL = 'http://localhost:3000' #os.getenv('FRONTEND_URL')
 BACKEND_URL = '127.0.0.1:8000' #os.getenv('BACKEND_URL')
 DOMAIN = '127.0.0.1:8000'  #os.getenv('DOMAIN')
 
